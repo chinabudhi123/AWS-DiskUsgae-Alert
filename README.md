@@ -1,98 +1,101 @@
-# Disk Utilization Monitoring for AWS (Multi-Account, Linux and Windows)
+# Multi-account disk monitoring on AWS (Ansible + SSM + CloudWatch)
 
-## Goal
-Monitor disk usage of all EC2 VMs in all AWS accounts, show it on dashboards (Dev and Prod),
-and send an alert when a disk is getting full. A newly created VM must be monitored automatically.
-
-## Tools used
-| Need | Tool |
-|---|---|
-| Inventory and alarm automation | Ansible (playbooks) |
-| Account setup in all accounts | CloudFormation StackSet |
-| Access to VMs (no SSH/RDP) | AWS Systems Manager (SSM) |
-| Agent install and config | SSM State Manager + CloudWatch Agent |
-| Auto tag for new VMs | EventBridge + SSM Automation |
-| Metrics, dashboards, alarms | CloudWatch |
-| Metrics from all accounts in one place | CloudWatch cross-account observability |
-| Notification | SNS (email) |
-
-## Why an agent is needed
-EBS metrics in CloudWatch show only performance (IOPS, throughput). They do not show how full the disk is.
-Disk usage is known only inside the OS, so the CloudWatch Agent is installed on each VM.
-Alerts are on the mount level (`/`, `/data`, `D:`), not on the EBS volume.
-One LVM mount can use several EBS volumes, so the inventory in Step 1 links mounts to volumes.
+Goal: detect low disk space on every EC2 VM across every AWS account/region early, using the
+existing Ansible stack plus only the cloud-native services that clearly earn their place
+(SSM, CloudWatch, Organizations/StackSets). No third-party monitoring platform, no SSH, no inbound ports.
 
 ## Architecture
-- Automation account: Ansible server.
-- Member accounts (Dev OU and Prod OU): VMs, SSM, CloudWatch Agent, alarms.
-- Monitoring account: dashboards, SNS topic, notification.
-- The agent sends metrics to CloudWatch in its own account over HTTPS (443). No network connection to the monitoring account is needed.
 
-## Step 1: Inventory
-Find the accounts, regions, VMs, OS and disks.
-- Use: Ansible `aws_ec2` inventory plus a playbook that assumes a role in each account.
-- It lists: account, region, VM, OS, EBS volumes, SSM managed (yes/no), IAM profile (yes/no), Monitoring tag (yes/no).
-- For the mounts, LVM and NFS inside the VM: use an Ansible playbook with the `aws_ssm` connection (works only on SSM-managed VMs).
-- Output: CSV files. Review them before moving on.
+```
+ Automation account                    Member accounts (1..N)                     Monitoring account
+ ┌───────────────────────┐ AssumeRole ┌──────────────────────────────┐  metrics   ┌──────────────────────┐
+ │ Ansible control node  │──────────▶ │ DiskMonAnsibleRole           │ ─(OAM)───▶ │ OAM sink             │
+ │ aws_ec2 inventory     │ SSM session│ EC2 + SSM agent + CW agent   │            │ CloudWatch dashboard │
+ │ CloudFormation StackSets│─deploy──▶│ SSM State Manager (enrol all)│  alarms    │ SNS diskmon-alerts   │
+ └───────────────────────┘            │ Alarms diskmon-warn/crit-*   │ ─(SNS)───▶ │ -> Slack / ITSM      │
+                                      └──────────────────────────────┘            └──────────────────────┘
+```
 
-## Step 2: Create the baseline in every account
-- Use: one CloudFormation template deployed as a StackSet to the Dev OU (Environment=Dev) and to the Prod OU (Environment=Prod).
-  New accounts in the OU get it automatically.
-- The template creates:
-  - IAM role `DiskMonAnsibleRole` for Ansible
-  - IAM role and instance profile `DiskMonInstanceProfile` for the VMs (policies: `AmazonSSMManagedInstanceCore`, `CloudWatchAgentServerPolicy`)
-  - the agent configuration (SSM Parameter Store)
-  - the SSM State Manager rules (Step 4)
-  - the auto-tag rule (Step 3)
-  - the link that shares metrics with the monitoring account
+Two collection paths, deliberately:
 
-## Step 3: Instance profile and tag
-- Tag to use: `Monitoring=enabled`.
-- New VMs, profile: use the launch template with `DiskMonInstanceProfile`.
-- New VMs, tag: use EventBridge. When a VM starts, it runs an SSM Automation that adds the tag.
-- Existing VMs: use an Ansible playbook that attaches `DiskMonInstanceProfile` (if the VM has no profile) and adds the tag.
-  Run it in dry-run first, then run it for real.
-- VMs that already have another IAM role: add the two policies to that role.
-- Check: use the Step 1 playbook again. Rows with "Monitoring tag = no" must be zero.
+| Path | Purpose | Mechanism |
+|---|---|---|
+| Continuous (primary) | Early warning, trends, alerting | CloudWatch agent publishes `disk_used_percent` every 5 min; alarms at 80% (warn) and 90% (crit), 3 consecutive periods |
+| On-demand (Ansible) | Audit, coverage proof, incident triage | `02_disk_report.yml` runs over SSM, writes `reports/disk_report.csv`, lists VMs Ansible could not reach |
 
-## Step 4: Agent install
-- Use: SSM State Manager. It finds VMs with the tag `Monitoring=enabled`, installs the CloudWatch Agent, and applies the config.
-- Linux (Amazon Linux, Ubuntu, RHEL): metric `disk_used_percent` per mount.
-- Windows: metric `LogicalDisk % Free Space` per drive.
-- Metric namespace: `CWAgent-Dev` for Dev accounts, `CWAgent-Prod` for Prod accounts.
-- Check: in CloudWatch Metrics, open the namespace. Each tagged VM should show its mounts within about 10 minutes.
-- If no data appears, check in this order: instance profile, SSM shows the VM as Online, the tag, outbound 443 to the SSM and CloudWatch endpoints.
+## 1. Access management
 
-## Step 5: Dashboards
-- Use: CloudWatch cross-account observability. Each member account links to the monitoring account.
-- Create two dashboards in the monitoring account with CloudFormation: `diskmon-dev` and `diskmon-prod`.
-- The split is by namespace (`CWAgent-Dev` and `CWAgent-Prod`), because a dashboard cannot filter on a tag.
-- Each dashboard shows the 20 fullest mounts (Linux) and the 20 drives with the least free space (Windows).
+- **Cross-account**: one role per account, `DiskMonAnsibleRole`, deployed by an Organizations service-managed
+  StackSet (`cloudformation/member-global.yaml`). Trust is limited to the single control-node role, not the account root.
+  The control node chains into each account with `credential_source = Ec2InstanceMetadata`
+  (profiles generated into `generated/aws_config`). No long-lived keys anywhere.
+- **Least privilege**: describe/list; `ssm:StartSession` only on instances in that account and not tagged `diskmon=disabled`;
+  S3 only on `ansible-ssm-<acct>-*`; alarm writes only on `alarm:diskmon-*`.
+- **Connectivity**: Ansible uses the `community.aws.aws_ssm` connection plugin: Session Manager over HTTPS,
+  so no SSH keys, no port 22, no bastions, works for private subnets (needs SSM VPC endpoints or NAT).
+  Sessions are IAM-authenticated and CloudTrail-logged; enable Session Manager logging to S3/CloudWatch for command audit.
+- **VM-side**: Default Host Management Configuration (DHMC, `01_bootstrap_ssm.yml`) makes every instance SSM-managed
+  without instance-profile work; `DiskMonInstanceRole` adds `CloudWatchAgentServerPolicy` for metric publishing.
 
-## Step 6: Alarms and alerts
-- Use: an Ansible playbook that creates the alarms in each account. Run it every hour, so new VMs and new mounts get alarms.
-- For every mount it creates two alarms:
-  - Warning: used 50% or more (Windows: free 50% or less)
-  - Critical: used 80% or more (Windows: free 20% or less)
-- The condition must stay true for 3 checks of 5 minutes, to avoid false alerts.
-- Alarm name starts with `diskmon-`.
-- Alarms send to the SNS topic `diskmon-alerts` in the monitoring account.
-- Notification: the SNS topic sends email.
+## 2. Data collection and aggregation
 
-## Step 7: Operations
-- Run the Step 1 inventory every week. Goal: zero VMs without tag and zero VMs not managed by SSM.
-- New account: put it in the OU (the StackSet deploys the baseline), then add it to the Ansible accounts file.
-- New region: deploy the StackSet to that region.
+- **Collection**: SSM State Manager associations (`member-regional.yaml`) target `InstanceIds: *`, so every managed instance
+  automatically gets the CloudWatch agent installed and configured from SSM Parameter `/diskmon/cwagent-config`.
+  Re-applied daily to correct drift. Ansible role `cw_agent` is the equivalent fallback (`03_install_agent.yml`, rolling 20%).
+- **Aggregation**: CloudWatch cross-account observability (OAM) links each member account/region to the monitoring account,
+  so one dashboard (`diskmon-fleet`) shows the fullest filesystems fleet-wide via Metrics Insights queries.
+- **Alerting**: `04_reconcile_alarms.yml` creates a warn and a crit alarm per (instance, mount) that is publishing data;
+  alarms notify the central SNS topic (email now; Slack via AWS Chatbot, ITSM via Lambda/EventBridge later).
+- **Ansible report**: `02_disk_report.yml` (agentless) for audits.
 
-## Where Ansible is used
-| Step | Ansible |
-|---|---|
-| 1 Inventory | Yes, inventory playbooks |
-| 3 Tag and profile for existing VMs | Yes, playbook |
-| 4 Agent install | No, SSM State Manager does it |
-| 6 Alarms | Yes, playbook run every hour |
+## 3. Scalability and enrolment
 
-## Notes
-- Test everything in one Dev account first.
-- A VM without the tag is not monitored. This is why the check in Step 3 and Step 7 is important.
-- If one account has both Dev and Prod VMs, the namespace split will not work. Use separate accounts or a second tag.
+| Event | What happens | Manual work |
+|---|---|---|
+| New VM | DHMC registers it; State Manager installs/configures agent; next hourly reconcile adds alarms | none |
+| New volume/mount | agent publishes new `path` dimension; reconcile adds alarms | none |
+| New account | joins the Org OU -> StackSet auto-deploys roles/plumbing; add to `accounts.yml` (or `discover_from_org: true`) and run `00_generate_inventory.yml` | one command |
+| New region | add to `regions`; deploy `member-regional.yaml` there | one StackSet region |
+| VM opt-out | tag `diskmon=disabled` | |
+| Coverage gaps | `02_disk_report.yml` lists UNREACHABLE instances (not SSM-managed) | investigate |
+
+Inventory is one `aws_ec2` source per account (parallel, cached), `forks: 50`, `strategy: free`.
+Roll-outs are `serial: 20%`.
+
+## Deploy order
+
+1. Monitoring account: `cloudformation/monitoring-account.yaml` (per region) -> note `OamSinkArn`, `AlertTopicArn`.
+2. Management/delegated-admin account: StackSets, service-managed, auto-deploy to the target OUs:
+   `member-global.yaml` (one region) and `member-regional.yaml` (each region; pass `OamSinkArn`).
+3. Control node: `ansible-galaxy collection install -r requirements.yml`, install `boto3`, AWS CLI and the Session Manager plugin.
+4. Edit `accounts.yml` and `group_vars/all.yml` (`alarm_topic_arn_template`).
+5. `ansible-playbook playbooks/00_generate_inventory.yml`
+6. `scripts/run.sh playbooks/01_bootstrap_ssm.yml`
+7. `scripts/run.sh playbooks/02_disk_report.yml` (smoke test: should list your VMs and CSV)
+8. `scripts/run.sh playbooks/04_reconcile_alarms.yml` (schedule hourly)
+
+## Known limits and trade-offs
+
+- Windows is alerted on FREE space (`LogicalDisk % Free Space`), Linux on USED space; thresholds are kept consistent (80% used == 20% free).
+- Per-instance alarm reconcile is simple and explicit but is O(metrics) API calls. Around several thousand
+  filesystems, move to CloudWatch Metrics Insights multi-series alarms or a Lambda reconciler.
+- CloudWatch cost is per metric (about one per instance per mount per month). Collect only `used_percent`; fewer mounts via `resources`.
+- Disk fill rate matters more than level for fast-filling volumes: add a `PREDICT_LINEAR`/anomaly alarm later.
+- Alarm SNS topic must be in the same region as the alarm (one topic per region).
+- The StackSet/OAM/SSM-document details were written to AWS docs but not deployed in a live Org from this repo;
+  run `cfn-lint` and a pilot OU first.
+
+## Operating system support
+
+| OS | Agent install (State Manager) | Metric | Alarm | Ansible fallback |
+|---|---|---|---|---|
+| Amazon Linux 2 / 2023 | `AWS-ConfigureAWSPackage` | `disk_used_percent` (dim: InstanceId, path, device, fstype) | used >= 80 / 90 | `roles/cw_agent/tasks/linux.yml` (package) |
+| Ubuntu / Debian | same | same | same | `.deb` from AWS |
+| RHEL / CentOS / Rocky | same | same | same | `.rpm` from AWS |
+| Windows Server | same | `LogicalDisk % Free Space` (dim: InstanceId, instance e.g. `C:`) | free <= 20 / 10 | `roles/cw_agent/tasks/windows.yml` (MSI) |
+
+How one rollout serves both OS families: the `Diskmon-ConfigureAgent` SSM document has one step per platform
+(precondition `platformType`), each applying its own config parameter
+(`/diskmon/cwagent-config-linux` or `/diskmon/cwagent-config-windows`). Ansible groups hosts into
+`linux` / `windows` from EC2 platform details; PowerShell shell type is set for Windows via `inventory/group_vars/windows.yml`.
+Windows over SSM needs `ansible.windows` and a PowerShell-capable SSM agent (current AMIs have it).

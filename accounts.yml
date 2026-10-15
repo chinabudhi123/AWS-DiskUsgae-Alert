@@ -1,0 +1,16 @@
+---
+# Account registry. Either list accounts here or set discover_from_org: true
+# (control node role needs organizations:ListAccounts in the management /
+# delegated-admin account).
+automation_account_id: "111111111111"
+monitoring_account_id: "444444444444"
+base_role_name: DiskMonAnsibleRole      # created in every member account by the StackSet
+credential_source: Ec2InstanceMetadata   # use EcsContainer if the control node is a container
+regions: [us-east-1, eu-west-1]          # default regions to scan
+
+discover_from_org: false
+exclude_account_ids: ["111111111111", "444444444444"]
+
+accounts:
+  - { name: prod-payments, id: "222222222222" }
+  - { name: dev-data,      id: "333333333333", regions: [us-east-1] }   # per-account override
